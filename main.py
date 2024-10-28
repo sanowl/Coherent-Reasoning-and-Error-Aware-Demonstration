@@ -95,12 +95,127 @@ class CoherentTransformer(nn.Module):
         )[:, self.config.d + 1, -1]
 
         return z_q, y_q
+    
+
+class DataGenerator:
+    """
+    working on createing the assumption from the 3.1 
+
+    """
+
+    def __init__(self, config: ModelConfig):
+        self.config = config
+
+    def generate_batch(self,batch_size:int,device:torch.device) -> Tuple[torch.Tensor, ...]:
+        """
+        Generates data following Assumption 3.1:
+        - x ~ N(0, I_d)
+        - z = β^T x
+        - y = z + ε, ε ~ N(0, σ²)
+        """
+        d ,D = self.config.d, self.config.D
+
+        # Sample β uniformly from unit sphere as per paper
+        beta = torch.randn(batch_size,d)
+        beat = F.normalize(beta, dim =1)
+
+        # genreate x n(0,i_d)
+        x = torch.randn(batch_size,D+1,d)
+        # Generate z = β^T x
+        z = torch.bmm(x, beta.unsqueeze(2))
+        # gen y =z + ε
+        epsilon = torch.randn_like(z) * np.sqrt(self.config.sigma2)
+        y = z +epsilon 
+
+        # construc e_Cot as per eq (3) in the paper
+        E_CoT = torch.zeros(batch_size, d + 2,D+1,device=device)
+        E_CoT[:, :d, :] = x.transpose(1, 2)
+        E_CoT[:,d:-1] = z[:,:-1,0]
+        E_CoT[:d,d + 1:-1] = y[:,:-1,0]
+
+        return E_CoT.to(device), z[:, -1].to(device), y[:, -1].to(device)
+    
+
+def train_model(config: ModelConfig, device: torch.device = torch.device('cuda')):
+
+    """
+    Training implementation following paper's optimization objective (6)
+    """
+
+    model = CoherentTransformer(config).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
+    data_generator = DataGenerator(config)
+
+    model.train()
+    for step in range(config.n_train_steps):
+       E_CoT, z_true, y_true = data_generator.generate_batch(config.batch_size, device)
+
+       z_pred , y_pred = model(E_CoT)
+
+       # compute loss follwing eq
+       loss = F.mse_loss(y_pred,y_true.squeeze())
+
+       optimizer.zero_grad()
+       loss.backward()
+       optimizer.step()
+
+       if step & 1000  ==0:
+           print(f"Step {step}, Loss: {loss.item():.6f}")
+
+    return model
 
 
+def evaluate_sensitivity(model: CoherentTransformer,
+                       config: ModelConfig,
+                       noise_type: str,
+                       noise_std: float,
+                       device: torch.device):
+    """
+    Implements sensitivity analysis from Section 3.3
+    """
+    model.eval()
+    data_generator = DataGenerator(config)
+    
+    total_loss = 0
+    n_eval = 1000
 
+    with torch.no_grad():
+        for _ in range(n_eval):
+            E_CoT , z_true , y_true = data_generator.generate_batch(1,device)
 
+            # adding some noise
+            if noise_type =='y':
+                E_CoT[:,config.d+1 :-1] += torch.randn_like(E_CoT[:,config.d+1,:-1]) * noise_std
+            elif noise_type == 'x':
+                E_CoT[: , :config.d,:] += torch.randn_like(E_CoT[:,config.d,:-1]) * noise_std
+            elif noise_type =='z':
+                E_CoT[:, config.d,:-1] += torch.randn_like(E_CoT[:,config])
 
-        #predecit y  using the eq 4 from the paper
+            z_pred,y_pred = model(E_CoT)
+            loss = F.mse_loss(y_pred,y_true.squeeze())
+            total_loss += loss.item()
+
+        return total_loss / n_eval
+    
+
+def main():
+    # set a random seedn
+    torch.manual_seed(42)
+
+    config= ModelConfig()
+
+    # training the model
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model= train_model(config,device)
+
+    # Run sensitivity analysis as in paper
+    noise_std = 1.0
+    for noise_type in ['y', 'x', 'z']:
+        sensitivity = evaluate_sensitivity(model, config, noise_type, noise_std, device)
+        print(f"Sensitivity to {noise_type}-noise: {sensitivity:.6f}")
+
+if __name__ == "__main__":
+    main()
 
 
 
